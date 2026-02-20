@@ -1,0 +1,19 @@
+  const handleAddToCart = () => {
+    addItem({
+      productId: `custom-${selectedProduct}-${Date.now()}`,
+      name: `Custom ${currentProduct.name}`,
+      price: currentProduct.price,
+      quantity: 1,
+      image: '/placeholder.svg',
+      customization: {
+        text: customText,
+        imageUrl: uploadedImage || undefined,
+        color: selectedColor,
+      },
+    });
+    setShowSuccess(true);
+    setTimeout(() => {
+      setShowSuccess(false);
+      openCart();
+    }, 1500);
+  };
