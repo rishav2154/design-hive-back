@@ -154,7 +154,7 @@ app.post("/api/verify-payment", async (req, res) => {
 app.get("/api/auth/me", auth, async (req, res) => {
   try {
     const [rows] = await db.query(
-      "SELECT id, name, email, role, avatar_url, created_at FROM users WHERE id=?",
+      "SELECT id, name, email, phone, role, avatar_url, created_at FROM users WHERE id=?",
       [req.user.id]
     );
 
@@ -167,6 +167,7 @@ app.get("/api/auth/me", auth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -830,7 +831,7 @@ app.put("/admin/orders/:id/status", auth, async (req, res) => {
   }
 
   const [result] = await db.query(
-    "UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?",
+    "UPDATE orders SET status = ? WHERE id = ?",
     [status, req.params.id]
   );
 
@@ -1057,7 +1058,7 @@ const upload = multer({ storage });
 
 app.post('/api/upload', upload.single('image'), (req, res) => {
   res.json({
-    imageUrl: `http://localhost:5000/uploads/${req.file.filename}`,
+    imageUrl: `https://api.thedesignhive.tech/uploads/${req.file.filename}`,
   });
 });
 
@@ -1204,7 +1205,7 @@ app.get("/api/products/:id", async (req, res) => {
 
 app.post("/api/upload", upload.single("image"), (req, res) => {
   res.json({
-    imageUrl: `http://localhost:5000/uploads/${req.file.filename}`,
+    imageUrl: `https://api.thedesignhive.tech/uploads/${req.file.filename}`,
   });
 });
 
@@ -1900,6 +1901,219 @@ app.post("/api/send-otp", async (req, res) => {
   }
 });
 
+
+/* ========================================================= */
+
+/* =========================================================
+   SECURE ADDRESS ROUTES (PRODUCTION SAFE)
+========================================================= */
+
+
+/* ===============================
+   GET ALL USER ADDRESSES
+=================================*/
+app.get("/api/addresses", auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const [addresses] = await db.query(
+      `SELECT * FROM addresses 
+       WHERE user_id = ? 
+       ORDER BY is_default DESC, created_at DESC`,
+      [userId]
+    );
+
+    res.json(addresses);
+  } catch (err) {
+    console.error("Fetch addresses error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+/* ===============================
+   CREATE ADDRESS
+=================================*/
+app.post("/api/addresses", auth, async (req, res) => {
+  try {
+    const {
+      full_name,
+      phone,
+      address_line1,
+      address_line2,
+      city,
+      state,
+      pincode
+    } = req.body;
+
+    const userId = req.user.id;
+
+    if (!full_name || !phone || !address_line1 || !city || !state || !pincode) {
+      return res.status(400).json({ message: "All required fields missing" });
+    }
+
+    const [[existingCount]] = await db.query(
+      `SELECT COUNT(*) as count 
+       FROM addresses 
+       WHERE user_id = ?`,
+      [userId]
+    );
+
+    const isFirst = existingCount.count === 0;
+
+    await db.query(
+      `INSERT INTO addresses 
+       (id, full_name, phone, address_line1, address_line2, city, state, pincode, user_id, is_default, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        uuidv4(),
+        full_name.trim(),
+        phone.trim(),
+        address_line1.trim(),
+        address_line2?.trim() || null,
+        city.trim(),
+        state.trim(),
+        pincode.trim(),
+        userId,
+        isFirst ? 1 : 0
+      ]
+    );
+
+    res.json({ success: true, message: "Address created successfully" });
+
+  } catch (err) {
+    console.error("Create address error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+/* ===============================
+   UPDATE ADDRESS
+=================================*/
+app.put("/api/addresses/:id", auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const {
+      full_name,
+      phone,
+      address_line1,
+      address_line2,
+      city,
+      state,
+      pincode
+    } = req.body;
+
+    const [result] = await db.query(
+      `UPDATE addresses 
+       SET full_name = ?, phone = ?, address_line1 = ?, address_line2 = ?, 
+           city = ?, state = ?, pincode = ?, updated_at = NOW()
+       WHERE id = ? AND user_id = ?`,
+      [
+        full_name?.trim(),
+        phone?.trim(),
+        address_line1?.trim(),
+        address_line2?.trim() || null,
+        city?.trim(),
+        state?.trim(),
+        pincode?.trim(),
+        id,
+        userId
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Address not found" });
+    }
+
+    res.json({ success: true, message: "Address updated successfully" });
+
+  } catch (err) {
+    console.error("Update address error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+/* ===============================
+   DELETE ADDRESS
+=================================*/
+app.delete("/api/addresses/:id", auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const [result] = await db.query(
+      `DELETE FROM addresses 
+       WHERE id = ? AND user_id = ?`,
+      [id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Address not found" });
+    }
+
+    res.json({ success: true, message: "Address deleted successfully" });
+
+  } catch (err) {
+    console.error("Delete address error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+/* ===============================
+   SET DEFAULT ADDRESS
+=================================*/
+app.patch("/api/addresses/:id/default", auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    // Remove old default
+    await db.query(
+      `UPDATE addresses 
+       SET is_default = 0 
+       WHERE user_id = ?`,
+      [userId]
+    );
+
+    // Set new default
+    const [result] = await db.query(
+      `UPDATE addresses 
+       SET is_default = 1 
+       WHERE id = ? AND user_id = ?`,
+      [id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Address not found" });
+    }
+
+    res.json({ success: true, message: "Default address updated" });
+
+  } catch (err) {
+    console.error("Set default error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/auth/profile", auth, async (req, res) => {
+  try {
+    const { name, phone } = req.body;
+
+    await db.query(
+      "UPDATE users SET name = ?, phone = ? WHERE id = ?",
+      [name, phone, req.user.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 /* ===============================
    🔍 VERIFY OTP
