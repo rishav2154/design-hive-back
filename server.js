@@ -8,10 +8,14 @@ require("dotenv").config();
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const axios = require("axios");
+const { normalizePhone, registerOtpRoutes } = require("./otp");
+const { createOrderNotificationService } = require("./order-notifications");
+const { registerWhatsAppWebhookRoutes } = require("./whatsapp-webhook");
 
 
 const app = express();
 app.use(cors());
+registerWhatsAppWebhookRoutes(app);
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ limit: "25mb", extended: true }));
 
@@ -20,7 +24,6 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 
 app.use("/uploads", express.static("uploads"));
-const otpStore = new Map();
 
 /* -------------------- DB -------------------- */
 const db = mysql.createPool({
@@ -29,6 +32,8 @@ const db = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
 });
+
+const orderNotifications = createOrderNotificationService({ db });
 
 /* -------------------- AUTH MIDDLEWARE -------------------- */
 const auth = (req, res, next) => {
@@ -260,6 +265,134 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token, user });
 });
 
+/* =========================================================
+   GOOGLE AUTH (Sign in / Sign up)
+   Frontend obtains an authorization code via Google Identity
+   Services (popup code flow) and sends it here. The server
+   exchanges it for tokens, verifies the ID token, then either
+   logs in the existing user or creates a new one.
+========================================================= */
+app.post("/api/auth/google", async (req, res) => {
+  try {
+    const { code } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ message: "Authorization code is required" });
+    }
+
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      console.error("GOOGLE AUTH: GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET is not set");
+      return res.status(500).json({ message: "Google sign-in is not configured on the server" });
+    }
+
+    // 1. Exchange the authorization code for tokens.
+    //    For the GIS popup code flow the redirect_uri MUST be "postmessage".
+    const tokenResponse = await axios.post(
+      "https://oauth2.googleapis.com/token",
+      new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: "postmessage",
+        grant_type: "authorization_code",
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    const { id_token } = tokenResponse.data;
+
+    // 2. Verify the ID token with Google's tokeninfo endpoint.
+    //    This validates the signature, issuer, and audience for us.
+    const ticket = await axios.get(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${id_token}`
+    );
+
+    const payload = ticket.data;
+
+    // Make sure the token was issued for our app.
+    if (payload.aud !== clientId) {
+      return res.status(400).json({ message: "Invalid Google token" });
+    }
+
+    if (payload.email_verified !== "true" && payload.email_verified !== true) {
+      return res.status(400).json({ message: "Google account email is not verified" });
+    }
+
+    const email = String(payload.email || "").toLowerCase();
+    const name = payload.name || email.split("@")[0];
+    const picture = payload.picture || null;
+
+    if (!email) {
+      return res.status(400).json({ message: "Could not retrieve email from Google" });
+    }
+
+    // 3. Look up the user by email.
+    const [users] = await db.query("SELECT * FROM users WHERE email=?", [email]);
+
+    let user;
+    if (users.length) {
+      user = users[0];
+
+      // Backfill missing profile fields from Google.
+      const updates = [];
+      const values = [];
+      if (!user.avatar_url && picture) {
+        updates.push("avatar_url = ?");
+        values.push(picture);
+      }
+      if (!user.name && name) {
+        updates.push("name = ?");
+        values.push(name);
+      }
+      if (updates.length) {
+        values.push(user.id);
+        await db.query(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, values);
+        user.avatar_url = user.avatar_url || picture;
+        user.name = user.name || name;
+      }
+    } else {
+      // 4. Create a new user (Google sign-up).
+      //    Set a random password so the account can't be used with
+      //    email/password until the user sets one via reset-password.
+      const randomPassword = crypto.randomBytes(32).toString("hex");
+      const hash = await bcrypt.hash(randomPassword, 10);
+
+      await db.query(
+        "INSERT INTO users (id, name, email, password, avatar_url) VALUES (UUID(), ?, ?, ?, ?)",
+        [name, email, hash, picture]
+      );
+
+      const [newUsers] = await db.query("SELECT * FROM users WHERE email=?", [email]);
+      user = newUsers[0];
+    }
+
+    // 5. Issue a JWT for the user.
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar_url: user.avatar_url,
+      },
+    });
+  } catch (err) {
+    const details = err.response?.data || err.message;
+    console.error("GOOGLE AUTH ERROR:", details);
+    res.status(400).json({ message: "Google sign-in failed. Please try again." });
+  }
+});
+
 app.post("/api/auth/reset-password", auth, async (req, res) => {
   const hash = await bcrypt.hash(req.body.password, 10);
   await db.query("UPDATE users SET password=? WHERE id=?", [
@@ -326,7 +459,7 @@ app.post("/api/checkout", auth, async (req, res) => {
       items,
       shipping_address,
       coupon,
-      payment_method = "cod",
+      payment_method = "online",
       payment_id = null,
       razorpay_order_id = null,
       razorpay_signature = null
@@ -335,42 +468,63 @@ app.post("/api/checkout", auth, async (req, res) => {
     if (!items || items.length === 0)
       return res.status(400).json({ message: "Cart is empty" });
 
+    if (payment_method !== "online" &&
+        payment_method !== "partial")
+      return res.status(400).json({
+        message: "Invalid payment method"
+      });
+
     if (!shipping_address?.phone)
       return res.status(400).json({ message: "Phone required" });
 
+    const verifiedPhone = normalizePhone(
+      shipping_address.phone,
+      process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || ""
+    );
+    if (!verifiedPhone)
+      return res.status(400).json({
+        message: "A valid phone number with country code is required"
+      });
 
     /* =========================
        VERIFY PHONE (STRICT)
+       Temporary bypass: set OTP_VERIFICATION_REQUIRED=false to let
+       customers order with just their phone number, without OTP.
+       Set it back to true to restore mandatory verification.
     ========================= */
 
-    const [[verified]] =
+    if (process.env.OTP_VERIFICATION_REQUIRED !== "false") {
+
+      const [[verified]] =
+        await connection.query(
+          `SELECT id, expires_at
+           FROM phone_otps
+           WHERE phone = ?
+           AND is_verified = 1
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [verifiedPhone]
+        );
+
+      if (!verified)
+        return res.status(400).json({
+          message: "Phone not verified"
+        });
+
+      if (new Date(verified.expires_at) < new Date())
+        return res.status(400).json({
+          message: "Phone verification expired"
+        });
+
+      // Consume OTP (one-time use)
       await connection.query(
-        `SELECT id, expires_at
-         FROM phone_otps
-         WHERE phone = ?
-         AND is_verified = 1
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        [shipping_address.phone]
+        `UPDATE phone_otps
+         SET is_verified = 0
+         WHERE id = ?`,
+        [verified.id]
       );
 
-    if (!verified)
-      return res.status(400).json({
-        message: "Phone not verified"
-      });
-
-    if (new Date(verified.expires_at) < new Date())
-      return res.status(400).json({
-        message: "Phone verification expired"
-      });
-
-    // Consume OTP (one-time use)
-    await connection.query(
-      `UPDATE phone_otps
-       SET is_verified = 0
-       WHERE id = ?`,
-      [verified.id]
-    );
+    }
 
 
     await connection.beginTransaction();
@@ -437,10 +591,36 @@ app.post("/api/checkout", auth, async (req, res) => {
 
 
     /* =========================
-       VERIFY ONLINE PAYMENT
+       PARTIAL PAYMENT SPLIT
+       "partial" = pay 50% online now, rest as Cash on Delivery.
     ========================= */
 
-    if (payment_method === "online") {
+    const PARTIAL_PREPAID_PERCENT = 50;
+
+    let prepaidAmount = 0;
+    let codAmount = 0;
+
+    if (payment_method === "partial") {
+
+      prepaidAmount = Number(
+        (finalAmount * PARTIAL_PREPAID_PERCENT / 100)
+          .toFixed(2)
+      );
+
+      codAmount = Number(
+        (finalAmount - prepaidAmount)
+          .toFixed(2)
+      );
+
+    }
+
+
+    /* =========================
+       VERIFY ONLINE / PARTIAL PAYMENT
+    ========================= */
+
+    if (payment_method === "online" ||
+        payment_method === "partial") {
 
       if (!razorpay_order_id ||
           !payment_id ||
@@ -512,6 +692,8 @@ app.post("/api/checkout", auth, async (req, res) => {
        INSERT ITEMS + STOCK LOCK
     ========================= */
 
+    const orderItems = [];
+
     for (const item of items) {
 
       const isCustom =
@@ -574,8 +756,36 @@ app.post("/api/checkout", auth, async (req, res) => {
         ]
       );
 
+      orderItems.push({
+        product_name: productName,
+        quantity: item.quantity,
+        price: item.price
+      });
+
     }
 
+    const [[customer]] = await connection.query(
+      `SELECT name, email, phone
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    await orderNotifications.enqueueForOrder(connection, {
+      id: orderId,
+      customer_name: shipping_address.full_name || customer?.name,
+      customer_phone: verifiedPhone,
+      customer_email: customer?.email,
+      customer_whatsapp_consent:
+        shipping_address.whatsapp_consent === true,
+      items: orderItems,
+      final_amount: finalAmount,
+      payment_method,
+      payment_status: payment_method === "online" ? "paid" : "pending",
+      payment_id,
+      address: shipping_address
+    });
 
     await connection.commit();
 
@@ -584,11 +794,17 @@ app.post("/api/checkout", auth, async (req, res) => {
        CLEANUP OLD OTPS
     ========================= */
 
-    await db.query(
-      `DELETE FROM phone_otps
-       WHERE phone = ?`,
-      [shipping_address.phone]
-    );
+    try {
+      await db.query(
+        `DELETE FROM phone_otps
+         WHERE phone = ?`,
+        [verifiedPhone]
+      );
+    } catch {
+      console.error("OTP cleanup failed after committed order", {
+        orderId
+      });
+    }
 
 
     res.json({
@@ -598,13 +814,21 @@ app.post("/api/checkout", auth, async (req, res) => {
       tax,
       shipping,
       discount,
-      final_amount: finalAmount
+      final_amount: finalAmount,
+      prepaid_amount: prepaidAmount,
+      cod_amount: codAmount
     });
+
+    orderNotifications.kick();
 
   }
   catch (err) {
 
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch {
+      console.error("Checkout rollback failed");
+    }
     console.error(err);
 
     res.status(400).json({
@@ -793,7 +1017,37 @@ app.get("/admin/orders", auth, async (req, res) => {
       ORDER BY o.created_at DESC
     `);
 
-    res.json(orders);
+    /* Amount still to be collected on delivery:
+       partial = remaining 50% balance, legacy COD = full total, online = 0. */
+    const PARTIAL_PREPAID_PERCENT = 50;
+
+    const withPayOnDelivery = orders.map((order) => {
+
+      const finalAmount = Number(order.final_amount || 0);
+
+      let payOnDelivery = 0;
+
+      if (order.payment_method === "partial") {
+
+        const prepaid = Number(
+          (finalAmount * PARTIAL_PREPAID_PERCENT / 100).toFixed(2)
+        );
+
+        payOnDelivery = Number(
+          (finalAmount - prepaid).toFixed(2)
+        );
+
+      } else if (!order.payment_method || order.payment_method === "cod") {
+
+        payOnDelivery = finalAmount;
+
+      }
+
+      return { ...order, pay_on_delivery: payOnDelivery };
+
+    });
+
+    res.json(withPayOnDelivery);
 
   } catch (err) {
 
@@ -1289,6 +1543,30 @@ app.get("/api/orders", auth, async (req, res) => {
         tax -
         discount;
 
+      /* Amount still to be collected on delivery:
+         partial = remaining 50% balance, legacy COD = full total, online = 0. */
+      const method = order.payment_method || "cod";
+
+      const PARTIAL_PREPAID_PERCENT = 50;
+
+      let payOnDelivery = 0;
+
+      if (method === "partial") {
+
+        const prepaid = Number(
+          (total * PARTIAL_PREPAID_PERCENT / 100).toFixed(2)
+        );
+
+        payOnDelivery = Number(
+          (total - prepaid).toFixed(2)
+        );
+
+      } else if (method === "cod") {
+
+        payOnDelivery = total;
+
+      }
+
       formattedOrders.push({
 
         id: order.id,
@@ -1311,6 +1589,8 @@ app.get("/api/orders", auth, async (req, res) => {
         tax,
         discount,
         total,
+
+        pay_on_delivery: payOnDelivery,
 
         shipping_address:
           JSON.parse(order.address || "{}"),
@@ -1477,11 +1757,14 @@ app.get("/api/orders/:id/invoice", auth, async (req, res) => {
         ? order.payment_status === "paid"
           ? "Paid Online (Razorpay)"
           : "Online Payment (Pending)"
-        : "Cash on Delivery";
+        : order.payment_method === "partial"
+          ? "50% Paid Online (Razorpay), 50% Cash on Delivery"
+          : "Cash on Delivery";
 
 
     const paymentIdHtml =
-      order.payment_method === "online" &&
+      (order.payment_method === "online" ||
+       order.payment_method === "partial") &&
       order.payment_id
         ? `<p><strong>Payment ID:</strong> ${order.payment_id}</p>`
         : "";
@@ -1823,83 +2106,7 @@ app.patch('/api/reviews/:id/helpful', async (req, res) => {
 /* ========================================================= */
 
 // ✅ OTP Routes
-
-const OTP_EXPIRY = parseInt(process.env.OTP_EXPIRY_MINUTES) || 5;
-const RESEND_COOLDOWN = parseInt(process.env.OTP_RESEND_COOLDOWN) || 60;
-
-app.post("/api/send-otp", async (req, res) => {
-  try {
-    const { phone } = req.body;
-
-    if (!phone) {
-      return res.status(400).json({ message: "Phone is required" });
-    }
-
-    const cleanPhone = phone.trim();
-
-    // Check cooldown
-    const [[existing]] = await db.query(
-      `SELECT created_at FROM phone_otps 
-       WHERE phone = ? 
-       ORDER BY created_at DESC LIMIT 1`,
-      [cleanPhone]
-    );
-
-    if (existing) {
-      const diff =
-        (new Date() - new Date(existing.created_at)) / 1000;
-
-      if (diff < RESEND_COOLDOWN) {
-        return res.status(429).json({
-          message: `Wait ${Math.ceil(
-            RESEND_COOLDOWN - diff
-          )} seconds before requesting again`
-        });
-      }
-    }
-
-    // Generate OTP
-    const otp =
-      Math.floor(100000 + Math.random() * 900000).toString();
-
-    const hashedOtp =
-      await bcrypt.hash(otp, 10);
-
-    const expiresAt =
-      new Date(Date.now() + OTP_EXPIRY * 60 * 1000);
-
-    // Delete old OTPs
-    await db.query(
-      "DELETE FROM phone_otps WHERE phone = ?",
-      [cleanPhone]
-    );
-
-    // Insert hashed OTP
-    await db.query(
-      `INSERT INTO phone_otps 
-      (id, phone, otp, expires_at, is_verified) 
-      VALUES (?, ?, ?, ?, 0)`,
-      [uuidv4(), cleanPhone, hashedOtp, expiresAt]
-    );
-
-    /* =========================
-       SEND OTP VIA APIHOME
-    ========================= */
-
-    const smsUrl =
-      `https://apihome.in/panel/api/bulksms/?key=${process.env.APIHOME_API_KEY}&mobile=${cleanPhone}&otp=${otp}`;
-
-    const response = await axios.get(smsUrl);
-
-    console.log("APIHome response:", response.data);
-
-    res.json({ message: "OTP sent successfully" });
-
-  } catch (err) {
-    console.error("Send OTP error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
+registerOtpRoutes(app, { db });
 
 
 /* ========================================================= */
@@ -2115,60 +2322,6 @@ app.put("/api/auth/profile", auth, async (req, res) => {
   }
 });
 
-/* ===============================
-   🔍 VERIFY OTP
-=================================*/
-app.post("/api/verify-otp", async (req, res) => {
-  try {
-    const { phone, otp } = req.body;
-
-    if (!phone || !otp) {
-      return res.status(400).json({
-        message: "Phone and OTP required"
-      });
-    }
-
-    const cleanPhone = phone.trim();
-    const cleanOtp = otp.trim();
-
-    const [[record]] = await db.query(
-      `SELECT * FROM phone_otps
-       WHERE phone = ? AND is_verified = 0
-       LIMIT 1`,
-      [cleanPhone]
-    );
-
-    if (!record) {
-      return res.status(400).json({ message: "Invalid OTP" });
-    }
-
-    if (new Date(record.expires_at) < new Date()) {
-      return res.status(400).json({ message: "OTP expired" });
-    }
-
-    const isMatch =
-      await bcrypt.compare(cleanOtp, record.otp);
-
-    if (!isMatch) {
-      return res.status(400).json({ message: "Invalid OTP" });
-    }
-
-    await db.query(
-      `UPDATE phone_otps SET is_verified = 1 WHERE id = ?`,
-      [record.id]
-    );
-
-    res.json({
-      success: true,
-      message: "Phone verified"
-    });
-
-  } catch (err) {
-    console.error("Verify OTP error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
 /* ========================================================= */
 
 app.get("/api/brands", async (req, res) => {
@@ -2202,6 +2355,8 @@ app.get("/api/cover-types/:modelId", async (req, res) => {
 });
 
 /* ========================================================= */
+
+orderNotifications.start();
 
 app.listen(process.env.PORT, () =>
   console.log("Server running on port " + process.env.PORT)
