@@ -14,7 +14,7 @@ const ENV = {
   WHATSAPP_PHONE_NUMBER_ID: "123456789012345",
   WHATSAPP_API_VERSION: "v23.0",
   WHATSAPP_TEMPLATE_NAME: "test_login_code",
-  WHATSAPP_TEMPLATE_LANGUAGE: "en_UK"
+  WHATSAPP_TEMPLATE_LANGUAGE: "en_US"
 };
 
 function response() {
@@ -154,6 +154,7 @@ test("normalizes international and explicitly configured ten-digit local numbers
   assert.equal(normalizePhone(" +1 (202) 555-0123 "), PHONE);
   assert.equal(normalizePhone(PHONE), PHONE);
   assert.equal(normalizePhone("98765 43210", "91"), "919876543210");
+  assert.equal(normalizePhone("09876543210", "91"), "919876543210");
   assert.equal(normalizePhone("+91 9876543210", "91"), "919876543210");
   assert.equal(normalizePhone("919876543210", "91"), "919876543210");
   assert.equal(normalizePhone("+1234567890"), "1234567890");
@@ -222,7 +223,7 @@ test("sends a secure OTP using the exact WhatsApp copy-code template payload", a
     type: "template",
     template: {
       name: "test_login_code",
-      language: { code: "en_UK" },
+      language: { code: "en_US" },
       components: [
         { type: "body", parameters: [{ type: "text", text: "729184" }] },
         { type: "button", sub_type: "url", index: "0", parameters: [{ type: "text", text: "729184" }] }

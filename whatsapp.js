@@ -29,6 +29,11 @@ function normalizePhone(phone, defaultCountryCode = "") {
   const international = input.startsWith("+");
   let digits = input.replace(/[ ()-]/g, "").replace(/^\+/, "");
 
+  // Local numbers may be entered as 9876543210 or 09876543210.
+  if (!international && digits.length === 11 && digits.startsWith("0")) {
+    digits = digits.slice(1);
+  }
+
   // Bare ten-digit numbers use an explicitly configured country code.
   if (!international && digits.length === 10) {
     const countryCode = String(defaultCountryCode).trim();

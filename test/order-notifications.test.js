@@ -758,5 +758,5 @@ test("checkout statically preserves transaction, response, cleanup, and post-res
   assert.ok(response < kick, "worker kick must happen after the response");
 
   assert.match(checkout, /try\s*{\s*await db\.query\(\s*`DELETE FROM phone_otps[\s\S]*?}\s*catch\s*{\s*console\.error\("OTP cleanup failed after committed order",\s*{\s*orderId\s*}\s*\);\s*}/);
-  assert.match(checkout, /res\.json\(\{\s*success: true,\s*order_id: orderId,\s*subtotal,\s*tax,\s*shipping,\s*discount,\s*final_amount: finalAmount\s*}\);/);
+  assert.match(checkout, /res\.json\(\{\s*success: true,\s*order_id: orderId,\s*subtotal,\s*tax,\s*shipping,\s*discount,\s*final_amount: finalAmount,\s*prepaid_amount: prepaidAmount,\s*cod_amount: codAmount\s*}\);/);
 });

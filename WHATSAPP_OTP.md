@@ -58,7 +58,7 @@ Official starting points:
 | `WHATSAPP_PHONE_NUMBER_ID` | Required | Registered sending number's numeric API ID. |
 | `WHATSAPP_API_VERSION` | Required | Explicit supported Graph API version, such as `v23.0`; confirm support for your Meta app. The server does not guess a version. |
 | `WHATSAPP_TEMPLATE_NAME` | Required | Exact approved authentication-template name. |
-| `WHATSAPP_TEMPLATE_LANGUAGE` | `en_UK` | Exact approved template language. |
+| `WHATSAPP_TEMPLATE_LANGUAGE` | `en_US` | Exact approved template language. |
 | `WHATSAPP_REQUEST_TIMEOUT_MS` | `10000` | Meta HTTP request timeout; positive integer up to `60000`. |
 | `WHATSAPP_VERIFY_TOKEN` | Required for webhook verification | Random shared value entered in Meta's Verify token field. |
 | `WHATSAPP_APP_SECRET` | Required for incoming webhooks | Meta App settings > Basic > App secret; validates `X-Hub-Signature-256`. This is different from the access token and verify token. |
@@ -69,7 +69,7 @@ Official starting points:
 | `OTP_SEND_MAX_REQUESTS` | `5` | Send requests per IP in that window, including failed requests. |
 | `OTP_VERIFY_MAX_ATTEMPTS` | `5` | Failed verification requests per normalized phone in that window, across IPs. |
 | `OTP_VERIFY_IP_MAX_ATTEMPTS` | `20` | Failed verification requests per IP in that window, across phones. |
-| `OTP_VERIFICATION_REQUIRED` | `true` | Set to `false` to temporarily let checkout accept any valid phone without OTP verification. OTP endpoints stay available; set back to `true` to restore enforcement. |
+  npm audit fix --force| `OTP_VERIFICATION_REQUIRED` | `true` | Set to `false` to temporarily let checkout accept any valid phone without OTP verification. OTP endpoints stay available; set back to `true` to restore enforcement. |
 | `WHATSAPP_ADMIN_PHONE` | Required for order alerts | One admin recipient in international format. |
 | `WHATSAPP_ADMIN_ORDER_TEMPLATE_NAME` | Required for order alerts | Approved nine-variable Utility template. |
 | `WHATSAPP_ADMIN_ORDER_TEMPLATE_LANGUAGE` | `en_US` | Exact approved admin-template language. |

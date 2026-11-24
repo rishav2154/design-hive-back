@@ -4,7 +4,9 @@
   "description": "",
   "main": "server.js",
   "scripts": {
-    "test": "node --test"
+    "start": "node server.js",
+    "test": "node --test",
+    "migrate:phone-covers": "node migrate-phone-cover-catalog.js"
   },
   "keywords": [],
   "author": "",
@@ -23,7 +25,7 @@
     "multer": "^2.0.2",
     "mysql2": "^3.16.2",
     "razorpay": "^2.9.6",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.5",
     "uuid": "^13.0.0"
   },
   "devDependencies": {

@@ -459,6 +459,7 @@ app.post("/api/checkout", auth, async (req, res) => {
       items,
       shipping_address,
       coupon,
+      coupons,
       payment_method = "online",
       payment_id = null,
       razorpay_order_id = null,
@@ -469,7 +470,8 @@ app.post("/api/checkout", auth, async (req, res) => {
       return res.status(400).json({ message: "Cart is empty" });
 
     if (payment_method !== "online" &&
-        payment_method !== "partial")
+        payment_method !== "partial" &&
+        payment_method !== "cod")
       return res.status(400).json({
         message: "Invalid payment method"
       });
@@ -479,11 +481,11 @@ app.post("/api/checkout", auth, async (req, res) => {
 
     const verifiedPhone = normalizePhone(
       shipping_address.phone,
-      process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || ""
+      process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || "91"
     );
     if (!verifiedPhone)
       return res.status(400).json({
-        message: "A valid phone number with country code is required"
+        message: "Enter a valid 10-digit Indian mobile number or include the country code"
       });
 
     /* =========================
@@ -493,7 +495,11 @@ app.post("/api/checkout", auth, async (req, res) => {
        Set it back to true to restore mandatory verification.
     ========================= */
 
-    if (process.env.OTP_VERIFICATION_REQUIRED !== "false") {
+    const phoneVerificationRequired =
+      process.env.OTP_VERIFICATION_REQUIRED !== "false" &&
+      payment_method !== "cod";
+
+    if (phoneVerificationRequired) {
 
       const [[verified]] =
         await connection.query(
@@ -533,55 +539,141 @@ app.post("/api/checkout", auth, async (req, res) => {
 
 
     /* =========================
-       CALCULATE TOTAL
+       VERIFY CART + CALCULATE TOTAL
     ========================= */
 
     let subtotal = 0;
+    const verifiedItems = [];
 
-    for (const item of items)
-      subtotal +=
-        Number(item.price) *
-        Number(item.quantity);
+    for (const item of items) {
+      const quantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
+      const customization = item.customization || {};
 
-    const shipping = 50;
-    const tax = Number((subtotal * 0.08).toFixed(2));
+      if (item.productId === "customize-phone-cover") {
+        const legacyCoverTypeId = customization.coverTypeId || customization.color || customization.coverType;
+        const [[coverType]] = legacyCoverTypeId
+          ? await connection.query(
+              "SELECT id, name, price FROM cover_types WHERE id = ? AND is_active = 1 LIMIT 1",
+              [legacyCoverTypeId]
+            )
+          : [[]];
+        if (!coverType) throw new Error("The selected cover type is no longer available");
+
+        const serverPrice = Number(coverType.price || 0);
+        subtotal += serverPrice * quantity;
+        verifiedItems.push({
+          ...item,
+          quantity,
+          serverPrice,
+          productName: item.name || `Custom ${coverType.name} Phone Cover`,
+          isLegacyCustom: true,
+          useModelStock: false,
+        });
+        continue;
+      }
+
+      const selectedModelId = String(customization.modelId || customization.model || "").trim();
+      const [[product]] = await connection.query(
+        `SELECT p.id, p.name, p.price, p.stock, p.category,
+                pcpm.model_id, pcpm.price_override, pcpm.stock_override,
+                pcpm.is_active AS model_is_active,
+                (SELECT COUNT(*) FROM phone_cover_product_models compatibility
+                 WHERE compatibility.product_id = p.id AND compatibility.is_active = 1) AS compatibility_count
+         FROM products p
+         LEFT JOIN phone_cover_product_models pcpm
+           ON pcpm.product_id = p.id AND pcpm.model_id = ?
+         WHERE p.id = ? AND p.is_active = 1
+         FOR UPDATE`,
+        [selectedModelId || null, item.productId]
+      );
+
+      if (!product) throw new Error("Product not found or unavailable");
+      const isPhoneCover = isPhoneCoverCategory(product.category);
+      if (isPhoneCover && Number(product.compatibility_count) > 0) {
+        if (!selectedModelId || !product.model_id || !Boolean(product.model_is_active)) {
+          throw new Error("This phone-cover product is not available for the selected model");
+        }
+      }
+
+      const useModelStock =
+        isPhoneCover && product.model_id && product.stock_override !== null;
+      const availableStock = useModelStock
+        ? Number(product.stock_override)
+        : Number(product.stock);
+      if (availableStock < quantity) throw new Error("Insufficient stock");
+
+      const serverPrice =
+        isPhoneCover && product.price_override !== null
+          ? Number(product.price_override)
+          : Number(product.price);
+      subtotal += serverPrice * quantity;
+      verifiedItems.push({
+        ...item,
+        quantity,
+        serverPrice,
+        productName: product.name,
+        useModelStock,
+        selectedModelId,
+        isLegacyCustom: false,
+      });
+    }
+
+    subtotal = Number(subtotal.toFixed(2));
+
+    let shipping = subtotal > 500 ? 0 : 50;
 
     let discount = 0;
+    const appliedCouponIds = [];
 
 
     /* =========================
        COUPON VALIDATION
     ========================= */
 
-    if (coupon) {
+    const couponCodes = [...new Set([
+      ...(Array.isArray(coupons) ? coupons : []),
+      coupon,
+    ]
+      .map((code) => String(code || "").trim().toUpperCase())
+      .filter(Boolean))].slice(0, 5);
 
-      const [[couponData]] =
-        await connection.query(
-          `SELECT *
-           FROM coupons
-           WHERE code = ?
+    for (const couponCode of couponCodes) {
+      const [[couponData]] = await connection.query(
+        `SELECT * FROM coupons
+         WHERE UPPER(code) = ?
            AND is_active = 1
-           AND (expires_at IS NULL OR expires_at > NOW())
-           AND (min_order_amount IS NULL OR ? >= min_order_amount)`,
-          [coupon.toUpperCase(), subtotal]
-        );
+           AND (valid_until IS NULL OR valid_until >= CURDATE())
+         LIMIT 1`,
+        [couponCode]
+      );
 
-      if (couponData) {
-
-        if (couponData.discount_type === "percentage")
-          discount =
-            subtotal *
-            couponData.discount_value / 100;
-
-        else if (couponData.discount_type === "fixed")
-          discount =
-            couponData.discount_value;
-
+      if (!couponData) throw new Error(`Coupon ${couponCode} is invalid or expired`);
+      if (couponData.usage_limit && Number(couponData.used_count || 0) >= Number(couponData.usage_limit)) {
+        throw new Error(`Coupon ${couponCode} usage limit reached`);
+      }
+      if (couponData.min_order_amount && subtotal < Number(couponData.min_order_amount)) {
+        throw new Error(`Coupon ${couponCode} requires a minimum order of ₹${couponData.min_order_amount}`);
       }
 
+      let couponDiscount = 0;
+      if (couponData.discount_type === "percentage") {
+        couponDiscount = subtotal * Number(couponData.discount_value || 0) / 100;
+      } else if (couponData.discount_type === "fixed") {
+        couponDiscount = Number(couponData.discount_value || 0);
+      } else if (couponData.discount_type === "free_shipping") {
+        shipping = 0;
+      }
+
+      if (couponData.max_discount) {
+        couponDiscount = Math.min(couponDiscount, Number(couponData.max_discount));
+      }
+      discount += couponDiscount;
+      appliedCouponIds.push(couponData.id);
     }
 
-    discount = Number(discount.toFixed(2));
+    discount = Number(Math.min(discount, subtotal).toFixed(2));
+    const discountedSubtotal = Math.max(0, subtotal - discount);
+    const tax = Number((discountedSubtotal * 0.08).toFixed(2));
 
     const finalAmount =
       Number(
@@ -611,6 +703,10 @@ app.post("/api/checkout", auth, async (req, res) => {
         (finalAmount - prepaidAmount)
           .toFixed(2)
       );
+
+    } else if (payment_method === "cod") {
+
+      codAmount = finalAmount;
 
     }
 
@@ -694,41 +790,26 @@ app.post("/api/checkout", auth, async (req, res) => {
 
     const orderItems = [];
 
-    for (const item of items) {
+    for (const item of verifiedItems) {
 
-      const isCustom =
-        item.productId ===
-        "customize-phone-cover";
+      const productName = item.productName || "Custom Product";
 
-      let productName =
-        item.name || "Custom Product";
-
-      if (!isCustom) {
-
-        const [[product]] =
+      if (!item.isLegacyCustom) {
+        if (item.useModelStock) {
           await connection.query(
-            `SELECT name, stock
-             FROM products
-             WHERE id = ?
-             FOR UPDATE`,
-            [item.productId]
+            `UPDATE phone_cover_product_models
+             SET stock_override = stock_override - ?
+             WHERE product_id = ? AND model_id = ?`,
+            [item.quantity, item.productId, item.selectedModelId]
           );
-
-        if (!product)
-          throw new Error("Product not found");
-
-        if (product.stock < item.quantity)
-          throw new Error("Insufficient stock");
-
-        productName = product.name;
-
-        await connection.query(
-          `UPDATE products
-           SET stock = stock - ?
-           WHERE id = ?`,
-          [item.quantity, item.productId]
-        );
-
+        } else {
+          await connection.query(
+            `UPDATE products
+             SET stock = stock - ?
+             WHERE id = ?`,
+            [item.quantity, item.productId]
+          );
+        }
       }
 
       await connection.query(
@@ -749,7 +830,7 @@ app.post("/api/checkout", auth, async (req, res) => {
           item.productId,
           productName,
           item.quantity,
-          item.price,
+          item.serverPrice,
           JSON.stringify(
             item.customization || {}
           )
@@ -759,7 +840,7 @@ app.post("/api/checkout", auth, async (req, res) => {
       orderItems.push({
         product_name: productName,
         quantity: item.quantity,
-        price: item.price
+        price: item.serverPrice
       });
 
     }
@@ -771,6 +852,13 @@ app.post("/api/checkout", auth, async (req, res) => {
        LIMIT 1`,
       [req.user.id]
     );
+
+    for (const couponId of appliedCouponIds) {
+      await connection.query(
+        "UPDATE coupons SET used_count = COALESCE(used_count, 0) + 1 WHERE id = ?",
+        [couponId]
+      );
+    }
 
     await orderNotifications.enqueueForOrder(connection, {
       id: orderId,
@@ -1312,7 +1400,7 @@ const upload = multer({ storage });
 
 app.post('/api/upload', upload.single('image'), (req, res) => {
   res.json({
-    imageUrl: `https://api.thedesignhive.tech/uploads/${req.file.filename}`,
+    imageUrl: `http://localhost:5000/uploads/${req.file.filename}`,
   });
 });
 
@@ -1459,7 +1547,7 @@ app.get("/api/products/:id", async (req, res) => {
 
 app.post("/api/upload", upload.single("image"), (req, res) => {
   res.json({
-    imageUrl: `https://api.thedesignhive.tech/uploads/${req.file.filename}`,
+    imageUrl: `http://localhost:5000/uploads/${req.file.filename}`,
   });
 });
 
@@ -2324,8 +2412,157 @@ app.put("/api/auth/profile", auth, async (req, res) => {
 
 /* ========================================================= */
 
+const normalizePhoneCoverCategory = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+const isPhoneCoverCategory = (value) =>
+  ["phone-cover", "phone-covers", "phone-case", "phone-cases"].includes(
+    normalizePhoneCoverCategory(value)
+  );
+
+const slugifyCatalogValue = (value) =>
+  String(value || "")
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+const defaultPhoneCoverSettings = {
+  hero_badge: "Phone Cover Studio",
+  hero_title: "Design Your Phone Cover",
+  hero_description: "Choose a product, phone model and cover type, then upload your design.",
+  instructions_title: "Special Instructions",
+  instructions_text: "Upload a high-resolution image and keep important details away from the edges.",
+  max_upload_mb: 10,
+  min_image_width: 1200,
+  min_image_height: 1600,
+  is_enabled: true,
+};
+
+const loadPhoneCoverCatalog = async (queryable, includeInactive = false) => {
+  const activeClause = includeInactive ? "" : "WHERE is_active = 1";
+  const productActiveClause = includeInactive ? "" : "WHERE p.is_active = 1";
+
+  const [settingsRows] = await queryable.query(
+    "SELECT * FROM phone_cover_page_settings WHERE id = 1 LIMIT 1"
+  );
+  const [brands] = await queryable.query(
+    `SELECT * FROM phone_brands ${activeClause} ORDER BY sort_order, name`
+  );
+  const [models] = await queryable.query(
+    `SELECT * FROM phone_models ${activeClause} ORDER BY sort_order, name`
+  );
+  const [coverTypes] = await queryable.query(
+    `SELECT * FROM cover_types ${activeClause} ORDER BY sort_order, name`
+  );
+  const [productRows] = await queryable.query(
+    `SELECT
+       p.*,
+       pcp.cover_type_id,
+       pcp.preview_image_url,
+       pcp.requires_image,
+       pcp.is_featured,
+       pcp.sort_order AS catalog_sort_order,
+       pcp.customizer_config,
+       ct.name AS cover_type_name
+     FROM products p
+     LEFT JOIN phone_cover_products pcp ON pcp.product_id = p.id
+     LEFT JOIN cover_types ct ON ct.id = pcp.cover_type_id
+     ${productActiveClause}
+     ORDER BY COALESCE(pcp.is_featured, 0) DESC,
+              COALESCE(pcp.sort_order, 0),
+              p.created_at DESC`
+  );
+  const [productModels] = await queryable.query(
+    `SELECT pcpm.product_id, pcpm.model_id, pcpm.sku,
+            pcpm.price_override, pcpm.stock_override, pcpm.is_active
+     FROM phone_cover_product_models pcpm
+     ${includeInactive ? "" : "WHERE pcpm.is_active = 1"}
+     ORDER BY pcpm.product_id, pcpm.created_at`
+  );
+
+  const modelsByProduct = new Map();
+  for (const row of productModels) {
+    if (!modelsByProduct.has(row.product_id)) modelsByProduct.set(row.product_id, []);
+    modelsByProduct.get(row.product_id).push({
+      model_id: row.model_id,
+      sku: row.sku || null,
+      price_override:
+        row.price_override === null ? null : Number(row.price_override),
+      stock_override:
+        row.stock_override === null ? null : Number(row.stock_override),
+      is_active: Boolean(row.is_active),
+    });
+  }
+
+  const products = productRows
+    .filter((product) => isPhoneCoverCategory(product.category))
+    .map((product) => {
+      const productModelRows = modelsByProduct.get(product.id) || [];
+      return {
+        id: product.id,
+        name: product.name,
+        description: product.description || "",
+        price: Number(product.price || 0),
+        original_price:
+          product.original_price === null ? null : Number(product.original_price),
+        stock: Number(product.stock || 0),
+        is_active: Boolean(product.is_active),
+        images: safeJsonParse(product.images, []),
+        tags: safeJsonParse(product.tags, []),
+        customization_options: safeJsonParse(product.customization_options, {}),
+        cover_type_id: product.cover_type_id || null,
+        cover_type_name: product.cover_type_name || null,
+        preview_image_url: product.preview_image_url || null,
+        requires_image:
+          product.requires_image === null || product.requires_image === undefined
+            ? true
+            : Boolean(product.requires_image),
+        is_featured: Boolean(product.is_featured),
+        sort_order: Number(product.catalog_sort_order || 0),
+        customizer_config: safeJsonParse(product.customizer_config, {}),
+        models: productModelRows,
+        supported_model_ids: productModelRows
+          .filter((row) => row.is_active !== false)
+          .map((row) => row.model_id),
+      };
+    });
+
+  const rawSettings = settingsRows[0] || {};
+  return {
+    settings: {
+      ...defaultPhoneCoverSettings,
+      ...rawSettings,
+      is_enabled:
+        rawSettings.is_enabled === undefined
+          ? defaultPhoneCoverSettings.is_enabled
+          : Boolean(rawSettings.is_enabled),
+    },
+    brands,
+    models,
+    coverTypes,
+    products,
+  };
+};
+
+app.get("/api/phone-covers/catalog", async (_req, res) => {
+  try {
+    res.json(await loadPhoneCoverCatalog(db, false));
+  } catch (err) {
+    console.error("Phone cover catalog error:", err);
+    res.status(500).json({ message: "Failed to load phone cover catalog" });
+  }
+});
+
 app.get("/api/brands", async (req, res) => {
-  const [brands] = await db.query("SELECT * FROM phone_brands ORDER BY name");
+  const [brands] = await db.query(
+    "SELECT * FROM phone_brands WHERE is_active = 1 ORDER BY sort_order, name"
+  );
   res.json(brands);
 });
 
@@ -2333,7 +2570,7 @@ app.get("/api/models/:brandId", async (req, res) => {
   const { brandId } = req.params;
 
   const [models] = await db.query(
-    "SELECT * FROM phone_models WHERE brand_id = ? ORDER BY name",
+    "SELECT * FROM phone_models WHERE brand_id = ? AND is_active = 1 ORDER BY sort_order, name",
     [brandId]
   );
 
@@ -2347,11 +2584,856 @@ app.get("/api/cover-types/:modelId", async (req, res) => {
     `SELECT c.*
      FROM cover_types c
      JOIN model_cover_types mct ON c.id = mct.cover_type_id
-     WHERE mct.model_id = ?`,
+     WHERE mct.model_id = ? AND c.is_active = 1
+     ORDER BY c.sort_order, c.name`,
     [modelId]
   );
 
   res.json(covers);
+});
+
+/* ========================================================= */
+/*  PHONE COVER CATALOG — ADMIN CRUD                          */
+/* ========================================================= */
+
+/* ---------- Brands ---------- */
+app.get("/api/admin/phone-cover/brands", auth, async (req, res) => {
+  try {
+    const [brands] = await db.query("SELECT * FROM phone_brands ORDER BY name");
+    res.json(brands);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.post("/api/admin/phone-cover/brands", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    if (!name) return res.status(400).json({ message: "Brand name is required" });
+
+    const id = uuidv4();
+    const brand = {
+      id,
+      name,
+      slug: slugifyCatalogValue(req.body.slug || name),
+      description: (req.body.description || "").trim() || null,
+      logo_url: (req.body.logo_url || "").trim() || null,
+      is_active: req.body.is_active === false ? 0 : 1,
+      sort_order: Number(req.body.sort_order) || 0,
+    };
+    await db.query(
+      `INSERT INTO phone_brands
+       (id, name, slug, description, logo_url, is_active, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        brand.id,
+        brand.name,
+        brand.slug,
+        brand.description,
+        brand.logo_url,
+        brand.is_active,
+        brand.sort_order,
+      ]
+    );
+    res.json(brand);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/admin/phone-cover/brands/:id", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    if (!name) return res.status(400).json({ message: "Brand name is required" });
+
+    const [result] = await db.query(
+      `UPDATE phone_brands
+       SET name = ?, slug = ?, description = ?, logo_url = ?,
+           is_active = ?, sort_order = ?
+       WHERE id = ?`,
+      [
+        name,
+        slugifyCatalogValue(req.body.slug || name),
+        (req.body.description || "").trim() || null,
+        (req.body.logo_url || "").trim() || null,
+        req.body.is_active === false ? 0 : 1,
+        Number(req.body.sort_order) || 0,
+        req.params.id,
+      ]
+    );
+    if (!result.affectedRows) return res.status(404).json({ message: "Brand not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/phone-cover/brands/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query(
+      "DELETE FROM model_cover_types WHERE model_id IN (SELECT id FROM phone_models WHERE brand_id = ?)",
+      [id]
+    );
+    await db.query("DELETE FROM phone_models WHERE brand_id = ?", [id]);
+    await db.query("DELETE FROM phone_brands WHERE id = ?", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Models ---------- */
+app.get("/api/admin/phone-cover/models", auth, async (req, res) => {
+  try {
+    const [models] = await db.query(
+      `SELECT m.*, b.name AS brand_name
+       FROM phone_models m
+       LEFT JOIN phone_brands b ON b.id = m.brand_id
+       ORDER BY b.name, m.name`
+    );
+    res.json(models);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.post("/api/admin/phone-cover/models", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    const brandId = (req.body.brand_id || "").trim();
+    if (!name || !brandId) {
+      return res.status(400).json({ message: "Brand and model name are required" });
+    }
+
+    const id = uuidv4();
+    await db.query(
+      `INSERT INTO phone_models
+       (id, brand_id, name, slug, image_url, release_year, is_active, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        brandId,
+        name,
+        slugifyCatalogValue(req.body.slug || name),
+        (req.body.image_url || "").trim() || null,
+        Number(req.body.release_year) || null,
+        req.body.is_active === false ? 0 : 1,
+        Number(req.body.sort_order) || 0,
+      ]
+    );
+    res.json({ id, brand_id: brandId, name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/admin/phone-cover/models/:id", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    const brandId = (req.body.brand_id || "").trim();
+    if (!name || !brandId) {
+      return res.status(400).json({ message: "Brand and model name are required" });
+    }
+
+    const [result] = await db.query(
+      `UPDATE phone_models
+       SET brand_id = ?, name = ?, slug = ?, image_url = ?, release_year = ?,
+           is_active = ?, sort_order = ?
+       WHERE id = ?`,
+      [
+        brandId,
+        name,
+        slugifyCatalogValue(req.body.slug || name),
+        (req.body.image_url || "").trim() || null,
+        Number(req.body.release_year) || null,
+        req.body.is_active === false ? 0 : 1,
+        Number(req.body.sort_order) || 0,
+        req.params.id,
+      ]
+    );
+    if (!result.affectedRows) return res.status(404).json({ message: "Model not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/phone-cover/models/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("DELETE FROM model_cover_types WHERE model_id = ?", [id]);
+    await db.query("DELETE FROM phone_models WHERE id = ?", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Cover types ---------- */
+app.get("/api/admin/phone-cover/cover-types", auth, async (req, res) => {
+  try {
+    const [covers] = await db.query("SELECT * FROM cover_types ORDER BY name");
+    res.json(covers);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.post("/api/admin/phone-cover/cover-types", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    const price = Number(req.body.price);
+    if (!name || !Number.isFinite(price)) {
+      return res.status(400).json({ message: "Name and a valid price are required" });
+    }
+
+    const id = uuidv4();
+    await db.query(
+      `INSERT INTO cover_types
+       (id, name, description, price, slug, image_url, is_active, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        name,
+        req.body.description || null,
+        price,
+        slugifyCatalogValue(req.body.slug || name),
+        (req.body.image_url || "").trim() || null,
+        req.body.is_active === false ? 0 : 1,
+        Number(req.body.sort_order) || 0,
+      ]
+    );
+    res.json({ id, name, description: req.body.description || null, price });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/admin/phone-cover/cover-types/:id", auth, async (req, res) => {
+  try {
+    const name = (req.body.name || "").trim();
+    const price = Number(req.body.price);
+    if (!name || !Number.isFinite(price)) {
+      return res.status(400).json({ message: "Name and a valid price are required" });
+    }
+
+    const [result] = await db.query(
+      `UPDATE cover_types
+       SET name = ?, description = ?, price = ?, slug = ?, image_url = ?,
+           is_active = ?, sort_order = ?
+       WHERE id = ?`,
+      [
+        name,
+        req.body.description || null,
+        price,
+        slugifyCatalogValue(req.body.slug || name),
+        (req.body.image_url || "").trim() || null,
+        req.body.is_active === false ? 0 : 1,
+        Number(req.body.sort_order) || 0,
+        req.params.id,
+      ]
+    );
+    if (!result.affectedRows) return res.status(404).json({ message: "Cover type not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.delete("/api/admin/phone-cover/cover-types/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("DELETE FROM model_cover_types WHERE cover_type_id = ?", [id]);
+    await db.query("DELETE FROM cover_types WHERE id = ?", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Model ↔ Cover type mapping ---------- */
+app.get("/api/admin/phone-cover/models/:modelId/cover-types", auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT cover_type_id FROM model_cover_types WHERE model_id = ?",
+      [req.params.modelId]
+    );
+    res.json(rows.map((row) => row.cover_type_id));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/admin/phone-cover/models/:modelId/cover-types", auth, async (req, res) => {
+  try {
+    const { modelId } = req.params;
+    const coverTypeIds = Array.isArray(req.body.coverTypeIds) ? req.body.coverTypeIds : [];
+
+    await db.query("DELETE FROM model_cover_types WHERE model_id = ?", [modelId]);
+
+    if (coverTypeIds.length) {
+      const values = coverTypeIds.map((coverTypeId) => [uuidv4(), modelId, coverTypeId]);
+      await db.query(
+        "INSERT INTO model_cover_types (id, model_id, cover_type_id) VALUES ?",
+        [values]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+const normalizePhoneCoverModelOptions = (value) => {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.reduce((rows, candidate) => {
+    const source = typeof candidate === "string" ? { model_id: candidate } : candidate || {};
+    const modelId = String(source.model_id || source.id || "").trim();
+    if (!modelId || seen.has(modelId)) return rows;
+    seen.add(modelId);
+    rows.push({
+      model_id: modelId,
+      sku: String(source.sku || "").trim() || null,
+      price_override:
+        source.price_override === "" || source.price_override === null || source.price_override === undefined
+          ? null
+          : Number(source.price_override),
+      stock_override:
+        source.stock_override === "" || source.stock_override === null || source.stock_override === undefined
+          ? null
+          : Math.max(0, Math.floor(Number(source.stock_override))),
+      is_active: source.is_active === false ? 0 : 1,
+    });
+    return rows;
+  }, []);
+};
+
+const replacePhoneCoverProductModels = async (connection, productId, rawOptions) => {
+  const options = normalizePhoneCoverModelOptions(rawOptions);
+  await connection.query(
+    "DELETE FROM phone_cover_product_models WHERE product_id = ?",
+    [productId]
+  );
+  if (!options.length) return;
+
+  const values = options.map((option) => [
+    uuidv4(),
+    productId,
+    option.model_id,
+    option.sku,
+    Number.isFinite(option.price_override) ? option.price_override : null,
+    Number.isFinite(option.stock_override) ? option.stock_override : null,
+    option.is_active,
+  ]);
+  await connection.query(
+    `INSERT INTO phone_cover_product_models
+     (id, product_id, model_id, sku, price_override, stock_override, is_active)
+     VALUES ?`,
+    [values]
+  );
+};
+
+app.get("/api/admin/phone-cover/products", auth, async (_req, res) => {
+  try {
+    const catalog = await loadPhoneCoverCatalog(db, true);
+    res.json(catalog.products);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to load phone-cover products" });
+  }
+});
+
+app.post("/api/admin/phone-cover/products", auth, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const name = String(req.body.name || "").trim();
+    const price = Number(req.body.price);
+    if (!name || !Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ message: "Name and a valid price are required" });
+    }
+
+    await connection.beginTransaction();
+    const productId = uuidv4();
+    await connection.query(
+      `INSERT INTO products
+       (id, name, description, price, original_price, category, images, stock,
+        tags, is_active, customization_options)
+       VALUES (?, ?, ?, ?, ?, 'phone-cover', ?, ?, ?, ?, ?)`,
+      [
+        productId,
+        name,
+        req.body.description || null,
+        price,
+        req.body.original_price || null,
+        JSON.stringify(Array.isArray(req.body.images) ? req.body.images : []),
+        Math.max(0, Math.floor(Number(req.body.stock) || 0)),
+        JSON.stringify(Array.isArray(req.body.tags) ? req.body.tags : []),
+        req.body.is_active === false ? 0 : 1,
+        JSON.stringify({ canAddImage: true, ...(req.body.customization_options || {}) }),
+      ]
+    );
+    await connection.query(
+      `INSERT INTO phone_cover_products
+       (product_id, cover_type_id, preview_image_url, requires_image,
+        is_featured, sort_order, customizer_config)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        productId,
+        req.body.cover_type_id || null,
+        req.body.preview_image_url || null,
+        req.body.requires_image === false ? 0 : 1,
+        req.body.is_featured === true ? 1 : 0,
+        Number(req.body.sort_order) || 0,
+        JSON.stringify(req.body.customizer_config || {}),
+      ]
+    );
+    await replacePhoneCoverProductModels(
+      connection,
+      productId,
+      req.body.models || req.body.model_ids
+    );
+    await connection.commit();
+    res.status(201).json({ id: productId, message: "Phone-cover product created" });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Failed to create phone-cover product" });
+  } finally {
+    connection.release();
+  }
+});
+
+app.put("/api/admin/phone-cover/products/:productId", auth, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const productId = req.params.productId;
+    const name = String(req.body.name || "").trim();
+    const price = Number(req.body.price);
+    if (!name || !Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ message: "Name and a valid price are required" });
+    }
+
+    await connection.beginTransaction();
+    const [result] = await connection.query(
+      `UPDATE products SET
+       name = ?, description = ?, price = ?, original_price = ?, category = 'phone-cover',
+       images = ?, stock = ?, tags = ?, is_active = ?, customization_options = ?
+       WHERE id = ?`,
+      [
+        name,
+        req.body.description || null,
+        price,
+        req.body.original_price || null,
+        JSON.stringify(Array.isArray(req.body.images) ? req.body.images : []),
+        Math.max(0, Math.floor(Number(req.body.stock) || 0)),
+        JSON.stringify(Array.isArray(req.body.tags) ? req.body.tags : []),
+        req.body.is_active === false ? 0 : 1,
+        JSON.stringify({ canAddImage: true, ...(req.body.customization_options || {}) }),
+        productId,
+      ]
+    );
+    if (!result.affectedRows) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Product not found" });
+    }
+    await connection.query(
+      `INSERT INTO phone_cover_products
+       (product_id, cover_type_id, preview_image_url, requires_image,
+        is_featured, sort_order, customizer_config)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         cover_type_id = VALUES(cover_type_id),
+         preview_image_url = VALUES(preview_image_url),
+         requires_image = VALUES(requires_image),
+         is_featured = VALUES(is_featured),
+         sort_order = VALUES(sort_order),
+         customizer_config = VALUES(customizer_config)`,
+      [
+        productId,
+        req.body.cover_type_id || null,
+        req.body.preview_image_url || null,
+        req.body.requires_image === false ? 0 : 1,
+        req.body.is_featured === true ? 1 : 0,
+        Number(req.body.sort_order) || 0,
+        JSON.stringify(req.body.customizer_config || {}),
+      ]
+    );
+    await replacePhoneCoverProductModels(
+      connection,
+      productId,
+      req.body.models || req.body.model_ids
+    );
+    await connection.commit();
+    res.json({ success: true });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Failed to update phone-cover product" });
+  } finally {
+    connection.release();
+  }
+});
+
+app.delete("/api/admin/phone-cover/products/:productId", auth, async (req, res) => {
+  try {
+    const [result] = await db.query(
+      "UPDATE products SET is_active = 0 WHERE id = ?",
+      [req.params.productId]
+    );
+    if (!result.affectedRows) return res.status(404).json({ message: "Product not found" });
+    await db.query(
+      "UPDATE phone_cover_product_models SET is_active = 0 WHERE product_id = ?",
+      [req.params.productId]
+    );
+    res.json({ success: true, message: "Product archived" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to archive phone-cover product" });
+  }
+});
+
+app.get("/api/admin/phone-cover/products/:productId/models", auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT model_id, sku, price_override, stock_override, is_active
+       FROM phone_cover_product_models WHERE product_id = ? ORDER BY created_at`,
+      [req.params.productId]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to load product compatibility" });
+  }
+});
+
+app.put("/api/admin/phone-cover/products/:productId/models", auth, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    await replacePhoneCoverProductModels(
+      connection,
+      req.params.productId,
+      req.body.models || req.body.model_ids
+    );
+    await connection.commit();
+    res.json({ success: true });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Failed to update product compatibility" });
+  } finally {
+    connection.release();
+  }
+});
+
+app.get("/api/admin/phone-cover/settings", auth, async (_req, res) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM phone_cover_page_settings WHERE id = 1 LIMIT 1"
+    );
+    res.json({ ...defaultPhoneCoverSettings, ...(rows[0] || {}) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to load phone-cover settings" });
+  }
+});
+
+app.put("/api/admin/phone-cover/settings", auth, async (req, res) => {
+  try {
+    const settings = { ...defaultPhoneCoverSettings, ...req.body };
+    await db.query(
+      `INSERT INTO phone_cover_page_settings
+       (id, hero_badge, hero_title, hero_description, instructions_title,
+        instructions_text, max_upload_mb, min_image_width, min_image_height, is_enabled)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         hero_badge = VALUES(hero_badge),
+         hero_title = VALUES(hero_title),
+         hero_description = VALUES(hero_description),
+         instructions_title = VALUES(instructions_title),
+         instructions_text = VALUES(instructions_text),
+         max_upload_mb = VALUES(max_upload_mb),
+         min_image_width = VALUES(min_image_width),
+         min_image_height = VALUES(min_image_height),
+         is_enabled = VALUES(is_enabled)`,
+      [
+        String(settings.hero_badge || "").trim(),
+        String(settings.hero_title || "").trim(),
+        String(settings.hero_description || "").trim(),
+        String(settings.instructions_title || "").trim(),
+        String(settings.instructions_text || "").trim(),
+        Math.max(1, Math.floor(Number(settings.max_upload_mb) || 10)),
+        Math.max(1, Math.floor(Number(settings.min_image_width) || 1200)),
+        Math.max(1, Math.floor(Number(settings.min_image_height) || 1600)),
+        settings.is_enabled === false ? 0 : 1,
+      ]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to update phone-cover settings" });
+  }
+});
+
+/* ========================================================= */
+/*  POP-UP ADVERTISEMENT BANNERS — PUBLIC + ADMIN             */
+/* ========================================================= */
+
+const BANNER_EVENT_TYPES = new Set(["view", "click", "copy", "dismiss"]);
+
+/* ---------- Public: fetch active banners + settings ---------- */
+app.get("/api/banners", async (req, res) => {
+  try {
+    const [settingsRows] = await db.query(
+      "SELECT is_enabled, permanent_close_on_last FROM ad_banner_settings WHERE id = 1"
+    );
+    const settings = settingsRows[0] || {
+      is_enabled: 1,
+      permanent_close_on_last: 0,
+    };
+
+    if (!settings.is_enabled) {
+      return res.json({
+        banners: [],
+        settings: { isEnabled: false, permanentCloseOnLast: false },
+      });
+    }
+
+    const [banners] = await db.query(
+      `SELECT id, title, description, image_url, coupon_code, cta_text, cta_link,
+              bg_color, text_color, accent_color, priority
+       FROM ad_banners
+       WHERE is_active = 1
+         AND (starts_at IS NULL OR starts_at <= NOW())
+         AND (ends_at IS NULL OR ends_at >= NOW())
+       ORDER BY priority DESC, created_at ASC`
+    );
+
+    res.json({
+      banners,
+      settings: {
+        isEnabled: true,
+        permanentCloseOnLast: !!settings.permanent_close_on_last,
+      },
+    });
+  } catch (err) {
+    console.error("Banners fetch error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Public: record view / click / copy / dismiss ---------- */
+app.post("/api/banners/:id/events", async (req, res) => {
+  try {
+    const eventType = req.body?.eventType;
+    if (!BANNER_EVENT_TYPES.has(eventType)) {
+      return res.status(400).json({ message: "Invalid event type" });
+    }
+
+    await db.query(
+      "INSERT INTO ad_banner_events (id, banner_id, event_type) VALUES (?, ?, ?)",
+      [uuidv4(), req.params.id, eventType]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Banner event error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: banner system settings ---------- */
+app.get("/api/admin/banners/settings", auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT is_enabled, permanent_close_on_last FROM ad_banner_settings WHERE id = 1"
+    );
+    const row = rows[0] || {};
+    res.json({
+      isEnabled: !!row.is_enabled,
+      permanentCloseOnLast: !!row.permanent_close_on_last,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.put("/api/admin/banners/settings", auth, async (req, res) => {
+  try {
+    const isEnabled = req.body.isEnabled ? 1 : 0;
+    const permanentCloseOnLast = req.body.permanentCloseOnLast ? 1 : 0;
+
+    await db.query(
+      `INSERT INTO ad_banner_settings (id, is_enabled, permanent_close_on_last)
+       VALUES (1, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         is_enabled = VALUES(is_enabled),
+         permanent_close_on_last = VALUES(permanent_close_on_last)`,
+      [isEnabled, permanentCloseOnLast]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: list banners with metrics ---------- */
+app.get("/api/admin/banners", auth, async (req, res) => {
+  try {
+    const [banners] = await db.query(
+      "SELECT * FROM ad_banners ORDER BY priority DESC, created_at DESC"
+    );
+
+    const [stats] = await db.query(
+      `SELECT banner_id, event_type, COUNT(*) AS count
+       FROM ad_banner_events
+       GROUP BY banner_id, event_type`
+    );
+
+    const statsMap = {};
+    for (const s of stats) {
+      statsMap[s.banner_id] = statsMap[s.banner_id] || {};
+      statsMap[s.banner_id][s.event_type] = Number(s.count);
+    }
+
+    res.json(
+      banners.map((b) => ({
+        ...b,
+        stats: {
+          views: statsMap[b.id]?.view || 0,
+          clicks: statsMap[b.id]?.click || 0,
+          copies: statsMap[b.id]?.copy || 0,
+          dismisses: statsMap[b.id]?.dismiss || 0,
+        },
+      }))
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: create banner ---------- */
+app.post("/api/admin/banners", auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = (b.title || "").trim();
+    if (!title) return res.status(400).json({ message: "Title is required" });
+
+    const id = uuidv4();
+    await db.query(
+      `INSERT INTO ad_banners
+       (id, title, description, image_url, coupon_code, cta_text, cta_link,
+        bg_color, text_color, accent_color, priority, is_active, starts_at, ends_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        title,
+        b.description || null,
+        b.image_url || null,
+        b.coupon_code ? String(b.coupon_code).toUpperCase() : null,
+        b.cta_text || null,
+        b.cta_link || null,
+        b.bg_color || "#1a1a2e",
+        b.text_color || "#ffffff",
+        b.accent_color || "#e94560",
+        Number.isFinite(Number(b.priority)) ? Number(b.priority) : 0,
+        b.is_active === false || b.is_active === 0 ? 0 : 1,
+        b.starts_at || null,
+        b.ends_at || null,
+      ]
+    );
+
+    res.json({ id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: update banner ---------- */
+app.put("/api/admin/banners/:id", auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = (b.title || "").trim();
+    if (!title) return res.status(400).json({ message: "Title is required" });
+
+    const [result] = await db.query(
+      `UPDATE ad_banners SET
+         title = ?, description = ?, image_url = ?, coupon_code = ?,
+         cta_text = ?, cta_link = ?, bg_color = ?, text_color = ?, accent_color = ?,
+         priority = ?, is_active = ?, starts_at = ?, ends_at = ?
+       WHERE id = ?`,
+      [
+        title,
+        b.description || null,
+        b.image_url || null,
+        b.coupon_code ? String(b.coupon_code).toUpperCase() : null,
+        b.cta_text || null,
+        b.cta_link || null,
+        b.bg_color || "#1a1a2e",
+        b.text_color || "#ffffff",
+        b.accent_color || "#e94560",
+        Number.isFinite(Number(b.priority)) ? Number(b.priority) : 0,
+        b.is_active === false || b.is_active === 0 ? 0 : 1,
+        b.starts_at || null,
+        b.ends_at || null,
+        req.params.id,
+      ]
+    );
+
+    if (!result.affectedRows) return res.status(404).json({ message: "Banner not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: publish / unpublish banner ---------- */
+app.patch("/api/admin/banners/:id/toggle", auth, async (req, res) => {
+  try {
+    await db.query("UPDATE ad_banners SET is_active = NOT is_active WHERE id = ?", [
+      req.params.id,
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* ---------- Admin: delete banner (cascade metrics) ---------- */
+app.delete("/api/admin/banners/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.query("DELETE FROM ad_banner_events WHERE banner_id = ?", [id]);
+    await db.query("DELETE FROM ad_banners WHERE id = ?", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 /* ========================================================= */

@@ -37,7 +37,7 @@ function createOtpHandlers({
     (env.WHATSAPP_TEMPLATE_NAME || "").trim();
 
   const language =
-    (env.WHATSAPP_TEMPLATE_LANGUAGE || "en_UK").trim();
+    (env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US").trim();
 
   const whatsapp = createWhatsAppClient({
     http,
